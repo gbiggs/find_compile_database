@@ -1,0 +1,292 @@
+#!/usr/bin/env python
+
+"""Finds a compilation database for the current workding directory."""
+
+from __future__ import print_function
+
+import argparse
+import json
+import os
+import os.path
+import sys
+import xml.etree.ElementTree
+
+verbose = False
+devnull = None
+
+
+def log():
+    """Return a destination file for log output.
+
+    The destination is determined by the verbose global flag.
+    """
+    global devnull
+    if verbose:
+        return sys.stderr
+    if not devnull:
+        devnull = open(os.devnull, 'w')
+    return devnull
+
+
+def is_header(f):
+    """Return True if f is a header file."""
+    return os.path.splitext(f)[1] in ['.h', '.hxx', '.hpp', '.hh']
+
+
+def get_equivalent_source(filename):
+    """Return the equivalent source file for the given filename.
+
+    If filename is a source file, that is returned.
+    If filename is a header file, the tree is searched for a matching source
+    file. First the same directory is searched. Then, if the path includes a
+    directory called 'include', the parent of that directory is searched. Then,
+    if that directory has a 'src' child directory, that 'src' directory and all
+    its children are searched in descending order.
+    """
+    def look_for_alternates(directory, filename):
+        source_exts = ['.cpp', '.cxx', '.cc', '.c', '.m', '.mm']
+        for e in source_exts:
+            alt_file = os.path.join(directory, filename + e)
+            if os.path.isfile(alt_file):
+                return alt_file
+        return None
+
+    if not is_header(filename):
+        return filename
+    search_dirs = [os.path.split(filename)[0]]
+    filename = os.path.splitext(os.path.basename(filename))[0]
+    if 'include' in search_dirs[0]:
+        search_dirs.append(search_dirs[0].partition('include/')[0])
+        if os.path.isdir(os.path.join(search_dirs[1], 'src')):
+            for d, cd, files in os.walk(os.path.join(search_dirs[1], 'src')):
+                search_dirs.append(os.path.join(search_dirs[1], d))
+    for d in search_dirs:
+        alt_file = look_for_alternates(d, filename)
+        if alt_file:
+            return alt_file
+    return None
+
+
+def get_actual_filename(db_filename, filename):
+    """Test if the filename is in the database.
+
+    Look in the database for the given file name, or the matching source file
+    if filename is a header file. If a matching entry is found in the database,
+    return the actual file name. Otherwise return None.
+    """
+    with open(db_filename, 'r') as db_f:
+        db = json.load(db_f)
+    actual_filename = get_equivalent_source(filename)
+    for entry in db:
+        if entry['file'] == actual_filename:
+            return actual_filename
+    return None
+
+
+def test_if_db_is_correct(db_filename, filename=None):
+    """Try to open a database and optionally find the specified file in it.
+
+    Attempt to open the specified database. If it exists and a filename is given, look in it for
+    the specified file. If the specified file is a header file, then look for the matching source
+    file.
+
+    If the database exists and a matching entry is found, return the database file name and the
+    name of the entry. Otherwise return None.
+    """
+    if not os.path.isfile(db_filename):
+        return None
+    if not filename:
+        return db_filename, None
+    actual_filename = get_actual_filename(db_filename, filename)
+    if actual_filename:
+        return db_filename, actual_filename
+    print('Compilation database {} does not have an entry for {} or any equivalents'.format(
+          db_filename, filename), file=log())
+    return None
+
+
+def get_colcon_ws_dir(search_dir, max_ascent):
+    """Return the path to the colcon workspace or None if not in a workspace."""
+    children = os.listdir(search_dir)
+    if 'build' in children and 'install' in children and 'src' in children:
+        return search_dir
+    if max_ascent == 0:
+        print('Maximum ascent reached while searching for colcon workspace', file=log())
+        return None
+    if search_dir == '/':
+        print('Root directory reached while searching for colcon workspace', file=log())
+        return None
+    return get_colcon_ws_dir(os.path.dirname(search_dir), max_ascent - 1)
+
+
+def get_colcon_package_name(search_dir, ws_dir):
+    """Find the colcon package name for the given directory.
+
+    The package name is pulled from the nearest package.xml.
+    Assumes that the working directory is within a colcon workspace.
+    The search stops when the colcon workspace root is hit.
+    Returns None if no package.xml was found.
+    """
+    if search_dir == ws_dir:
+        print('Could not find package.xml', file=log())
+        return None
+    pxml = os.path.join(search_dir, 'package.xml')
+    if os.path.isfile(pxml):
+        with open(pxml, 'r') as f:
+            doc = xml.etree.ElementTree.parse(f)
+        n = doc.find('name')
+        if n is None or not n.text:
+            print('{} did not have a "name" element or it was empty'.format(pxml), file=log())
+            return None
+        return n.text
+    return get_colcon_package_name(os.path.dirname(search_dir), ws_dir)
+
+
+def get_colcon_db(working_dir, comp_db_name, max_ascent, filename=None):
+    """Find a compilation database in a colcon workspace."""
+    ws_dir = get_colcon_ws_dir(working_dir, max_ascent)
+    if not ws_dir:
+        print('Not in an colcon workspace', file=log())
+        return None
+    print('Found colcon workspace directory at {}'.format(ws_dir), file=log())
+    ws_build_dir = os.path.join(ws_dir, 'build')
+    # Try the build directory's all-in-one database first
+    result = test_if_db_is_correct(os.path.join(ws_build_dir, comp_db_name), filename)
+    if result:
+        db = result[0]
+        print('Using workspace-global database {}'.format(db), file=log())
+        return db
+    # Now try the package-specific database
+    package = get_colcon_package_name(working_dir, ws_dir)
+    if not package:
+        print('Could not find package name for {}'.format(working_dir), file=log())
+        return None
+    print('Found package name {}'.format(package), file=log())
+    pkg_build_dirs = os.listdir(ws_build_dir)
+    if package not in pkg_build_dirs:
+        print('No package directory found in {}'.format(ws_build_dir), file=log())
+        return None
+    result = test_if_db_is_correct(os.path.join(ws_build_dir, package, comp_db_name), filename)
+    if result:
+        db = result[0]
+        print('Using package-specific database {}'.format(db), file=log())
+        return db
+    return None
+
+
+def get_build_dir_db(search_dir, comp_db_name, max_ascent, filename=None):
+    """Find a compilation database in a CMake-style build directory."""
+    db = os.path.join(search_dir, 'build', comp_db_name)
+    print('Searching for {} ({} iterations remaining)'.format(db, max_ascent), file=log())
+    result = test_if_db_is_correct(db, filename)
+    if result:
+        db = result[0]
+        print('Using project build directory database {}'.format(db), file=log())
+        return db
+    if max_ascent == 0:
+        return None
+    if search_dir == '/':
+        return None
+    return get_build_dir_db(os.path.dirname(search_dir), comp_db_name, max_ascent - 1)
+
+
+def get_parent_dir_db(search_dir, comp_db_name, max_ascent, filename=None):
+    """Find a compilation database in a parent directory."""
+    db = os.path.join(search_dir, comp_db_name)
+    print('Searching for {} ({} iterations remaining)'.format(db, max_ascent), file=log())
+    result = test_if_db_is_correct(db, filename)
+    if result:
+        db = result[0]
+        print('Using ancestor directory database {}'.format(db), file=log())
+        return db
+    if max_ascent == 0:
+        return None
+    if search_dir == '/':
+        return None
+    return get_parent_dir_db(os.path.dirname(search_dir), comp_db_name, max_ascent - 1)
+
+
+def find_compile_db_for_file(filename, comp_db_name='compile_commands.json', max_ascent=10):
+    """Find a compilation database for filename."""
+    print('Searching for a compilation database named {} for file {}, with '
+          'maximum ascent of {}'.format(comp_db_name, filename, max_ascent),
+          file=log())
+    filename = os.path.abspath(filename)
+    directory = os.path.dirname(filename)
+    print('Full file name is {}'.format(filename), file=log())
+    db = get_colcon_db(directory, comp_db_name, max_ascent, filename)
+    if not db:
+        db = get_build_dir_db(directory, comp_db_name, max_ascent, filename)
+    if not db:
+        db = get_parent_dir_db(directory, comp_db_name, max_ascent, filename)
+    if not db:
+        print('Could not find a compilation database for file {}'.format(filename), file=log())
+        return None
+    return db
+
+
+def find_compile_db_for_dir(directory, comp_db_name='compile_commands.json', max_ascent=10):
+    """Find a compilation database for directory."""
+    print('Searching for a compilation database named {} for directory {}, with '
+          'maximum ascent of {}'.format(comp_db_name, directory, max_ascent),
+          file=log())
+    db = get_colcon_db(directory, comp_db_name, max_ascent)
+    if not db:
+        db = get_build_dir_db(directory, comp_db_name, max_ascent)
+    if not db:
+        db = get_parent_dir_db(directory, comp_db_name, max_ascent)
+    if not db:
+        print('Could not find a compilation database for directory {}'.format(directory),
+              file=log())
+        return None
+    return db
+
+
+def main(argv):
+    """Use this function when calling as an executable."""
+    global verbose
+    parser = argparse.ArgumentParser(description='Find the compilation '
+                                     'database matching a given source file')
+    parser.add_argument('-d', '--directory',
+                        help='The directory to search for a DB for')
+    parser.add_argument('-f', '--file',
+                        help='The source file to search for a DB for')
+    parser.add_argument('-m', '--max-ascent', type=int, default=8,
+                        help='Maximum number of parent levels above the '
+                        'start directory to search in '
+                        '(Default: %(default)s)')
+    parser.add_argument('-n', '--comp-db-name', type=str,
+                        default='compile_commands.json',
+                        help='The name of the compilation database file '
+                        '(Default: %(default)s)')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help='Enable verbose output to stderr')
+    args = parser.parse_args()
+    verbose = args.verbose
+    if args.file:
+        print('Searching for a compilation database for file {}'.format(args.file), file=log())
+        if not os.path.exists(args.file):
+            print('No such file', file=log())
+            return 1
+        if not os.path.isfile(args.file):
+            print('Not a file', file=log())
+            return 1
+        db = find_compile_db_for_file(args.file, args.comp_db_name, args.max_ascent)
+    elif args.directory:
+        print('Searching for a compilation database for directory {}'.format(args.directory),
+              file=log())
+        if not os.path.isdir(args.directory):
+            print('Not a directory', file=log())
+            return 1
+        db = find_compile_db_for_dir(args.directory, args.comp_db_name, args.max_ascent)
+    else:
+        print('Searching for a compilation database for cwd {}'.format(os.getcwd()), file=log())
+        db = find_compile_db_for_dir(os.getcwd(), args.comp_db_name, args.max_ascent)
+    if db:
+        print(db)
+        return 0
+    return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))
